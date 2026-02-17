@@ -1,5 +1,5 @@
 
-using Ferrite, TriShellFiniteElement 
+using TriShellFiniteElement
 
 
 E = 200000.0
@@ -7,11 +7,11 @@ t = 1.0
 ν = 0.30
 
 ######
-grid = generate_grid(Triangle, (1, 1), Vec((0.0, 0.0)), Vec((2.0, 1.0)));                      
+grid = generate_grid(Triangle, (1, 1), Vec((0.0, 0.0)), Vec((2.0, 1.0)));
 
-ip = Lagrange{RefTriangle,1}() #to define fields only 
+ip = Lagrange{RefTriangle,1}() #to define fields only
 ip3 = TriShellFiniteElement.IP3()
-qr1 = QuadratureRule{RefTriangle}(1)  
+qr1 = QuadratureRule{RefTriangle}(1)
 
 dh = DofHandler(grid)
 add!(dh, :u, ip^3)
@@ -27,19 +27,20 @@ cell = first(CellIterator(dh))
 
 qr = qr1
 
-cv = CellValues(qr1, ip3, ip3) 
+cv = CellValues(qr1, ip3, ip3)
 
 x = getcoordinates(cell)
 
 reinit!(cv, x)
 
 
-    num_shape_functions = getnbasefunctions(ip_shape)
+num_shape_functions = getnbasefunctions(ip_shape)
 
-    kgx = zeros(Float64, 15, 15)
-    kgy = zeros(Float64, 15, 15)
-    kgxy = zeros(Float64, 15, 15)
-    
+kgx = zeros(Float64, 15, 15)
+kgy = zeros(Float64, 15, 15)
+kgxy = zeros(Float64, 15, 15)
+
+function integrate!(kgx, kgy, kgxy, cv, qr)
     for q_point in 1:getnquadpoints(cv)
 
         # q_point = 1
@@ -47,7 +48,7 @@ reinit!(cv, x)
         ξ = qr.points[q_point]
         J = TriShellFiniteElement.get_jacobian(ξ, ip_geo, x)
         Jinv = inv(J)
-        
+
         dNdξ_x = [cv.fun_values.dNdξ[i + (q_point-1)*num_shape_functions][1] for i=1:num_shape_functions]
         dNdξ_y = [cv.fun_values.dNdξ[i + (q_point-1)*num_shape_functions][2] for i=1:num_shape_functions]
 
@@ -66,6 +67,14 @@ reinit!(cv, x)
         kgxy += GGxy .* det(J) .* qr.weights[q_point]
 
     end
+    return kgx, kgy, kgxy
+end
 
-    #σ is local coordinate system stress, at  the Gauss point (constant stress in this case), σ = [σx, σy, σxy]
-    kg = σ[1] .* kgx + σ[2] .* kgy + σ[3] .* kgxy
+# integrate
+kgx, kgy, kgxy = integrate!(kgx, kgy, kgxy, cv, qr)
+
+# σx, σy, σxy right now these are in the element local coordinate system
+σ = (-1.0, 0.0, 0.0)
+
+#σ is local coordinate system stress, at  the Gauss point (constant stress in this case), σ = [σx, σy, σxy]
+kg = σ[1] .* kgx + σ[2] .* kgy + σ[3] .* kgxy
