@@ -40,3 +40,4 @@ docs/src/tutorials
 docs/src/howto
 
 .vscode
+.DS_Store
