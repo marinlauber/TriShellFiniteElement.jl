@@ -35,6 +35,10 @@ docs/site/
 *.sqlite
 *.jld2
 
+# Gmsh files
+*.geo
+*.msh
+
 # Documenter files
 docs/src/tutorials
 docs/src/howto
