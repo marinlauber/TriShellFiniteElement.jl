@@ -3,53 +3,21 @@ module TriShellFiniteElement
 using Ferrite, LinearAlgebra, Tensors
 import Ferrite: reinit!
 
-# ─── Custom interpolations ────────────────────────────────────────────────────
 
-struct IP6 <: ScalarInterpolation{RefTriangle, 2}
-end
+"""
+    ShellCellValues{}
 
-function Ferrite.reference_shape_value(ip::IP6, ξ::Vec{2}, i::Int)
-    ξ₁, ξ₂ = ξ[1], ξ[2]
-    i == 1 && return 1 - ξ₁ - ξ₂
-    i == 2 && return ξ₁
-    i == 3 && return ξ₂
-    i == 4 && return 4ξ₁ * (1 - ξ₁ - ξ₂)
-    i == 5 && return 4ξ₁ * ξ₂
-    i == 6 && return 4ξ₂ * (1 - ξ₁ - ξ₂)
-    throw(ArgumentError("no shape function $i for interpolation $ip"))
-end
+Stores precomputed geometry quantities for a flat triangular shell element.
+Works with Vec{3} node coordinates — no manual 2D projection required.
+ip_geo and ip_shape can be any Ferrite interpolation (Lagrange, etc.).
 
-Ferrite.getnbasefunctions(::IP6) = 6
-Ferrite.adjust_dofs_during_distribution(::IP6) = false
-
-
-struct IP3 <: ScalarInterpolation{RefTriangle, 2}
-end
-
-function Ferrite.reference_shape_value(ip::IP3, ξ::Vec{2}, i::Int)
-    ξ₁, ξ₂ = ξ[1], ξ[2]
-    i == 1 && return 1 - ξ₁ - ξ₂
-    i == 2 && return ξ₁
-    i == 3 && return ξ₂
-    throw(ArgumentError("no shape function $i for interpolation $ip"))
-end
-
-Ferrite.getnbasefunctions(::IP3) = 3
-Ferrite.adjust_dofs_during_distribution(::IP3) = false
-
-
-# ─── ShellCellValues ──────────────────────────────────────────────────────────
-#
-# Stores precomputed geometry quantities for a flat triangular shell element.
-# Works with Vec{3} node coordinates — no manual 2D projection required.
-#
-# On reinit!(scv, x):
-#   - Builds the 3×2 surface Jacobian from the geometry interpolation
-#   - Extracts the orthonormal local frame (t1, t2, n) via Gram-Schmidt
-#   - Projects shape function gradients to the local 2D tangent plane
-#   - Computes the area-weighted integration weight detJdV
-
-mutable struct ShellCellValues{QR, IPG, IPS, T <: AbstractFloat}
+On reinit!(scv, x):
+   - Builds the 3×2 surface Jacobian from the geometry interpolation
+   - Extracts the orthonormal local frame (t1, t2, n) via Gram-Schmidt
+   - Projects shape function gradients to the local 2D tangent plane
+   - Computes the area-weighted integration weight detJdV
+"""
+struct ShellCellValues{QR, IPG, IPS, T <: AbstractFloat} <: AbstractCellValues
     qr          :: QR
     ip_geo      :: IPG
     ip_shape    :: IPS
@@ -58,8 +26,11 @@ mutable struct ShellCellValues{QR, IPG, IPS, T <: AbstractFloat}
     detJdV      :: Vector{T}           # area element × weight (n_qp,)
     local_frame :: Matrix{T}           # 3×3 rotation matrix [t1 | t2 | n]
 end
+export ShellCellValues
 
-function ShellCellValues(qr, ip_geo, ip_shape)
+Ferrite.getdetJdV(scv::ShellCellValues, q::Int) = scv.detJdV[q]
+
+function ShellCellValues(qr::QuadratureRule, ip_geo::Interpolation, ip_shape::Interpolation)
     n_qp    = length(qr.weights)
     n_shape = getnbasefunctions(ip_shape)
     ShellCellValues(
@@ -71,6 +42,7 @@ function ShellCellValues(qr, ip_geo, ip_shape)
     )
 end
 
+reinit!(scv::ShellCellValues, cell) = reinit!(scv, getcoordinates(cell))
 function reinit!(scv::ShellCellValues, x::AbstractVector{<:Vec{3}})
     n_geo   = getnbasefunctions(scv.ip_geo)
     n_shape = getnbasefunctions(scv.ip_shape)
@@ -98,8 +70,7 @@ function reinit!(scv::ShellCellValues, x::AbstractVector{<:Vec{3}})
         t2     = n_unit × t1
 
         # Store local frame from the first quadrature point.
-        # For linear geometry (IP3) J is constant over the element, so this
-        # is exact; for higher-order geometry one would store per-qp frames.
+        # For linear geometry J is constant over the element, so this is exact.
         if q == 1
             scv.local_frame[:, 1] .= Tuple(t1)
             scv.local_frame[:, 2] .= Tuple(t2)
@@ -122,11 +93,11 @@ function reinit!(scv::ShellCellValues, x::AbstractVector{<:Vec{3}})
             α2 = (g11 * dNdξ[2] - g12 * dNdξ[1]) / det_g
 
             # Physical gradient (Vec{3} in the tangent plane), projected to (t1, t2)
-            ∇N_global   = J1 * α1 + J2 * α2
+            ∇N_global    = J1 * α1 + J2 * α2
             scv.∇N[q, i] = Vec{2}((∇N_global ⋅ t1, ∇N_global ⋅ t2))
         end
     end
-    return scv
+    return nothing
 end
 
 
@@ -157,9 +128,10 @@ end
 # ─── Element stiffness matrices ───────────────────────────────────────────────
 
 function calculate_element_membrane_stiffness_matrix(D, scv::ShellCellValues)
-    ke = zeros(6, 6)
+    n  = getnbasefunctions(scv.ip_geo)
+    ke = zeros(2n, 2n)
     for q in eachindex(scv.detJdV)
-        B = hcat(ntuple(3) do i
+        B = hcat(ntuple(n) do i
             dx, dy = scv.∇N[q, i]
             [dx   0.0
              0.0  dy
@@ -171,16 +143,17 @@ function calculate_element_membrane_stiffness_matrix(D, scv::ShellCellValues)
 end
 
 function calculate_element_bending_stiffness_matrix(D, scv::ShellCellValues)
+    n_geo = getnbasefunctions(scv.ip_geo)
     ke = zeros(18, 18)
     for q in eachindex(scv.detJdV)
         B = hcat(
-            ntuple(3) do i
+            ntuple(n_geo) do i
                 dx, dy = scv.∇N[q, i]
                 [0.0  0.0   dx
                  0.0  -dy   0.0
                  0.0  -dx   dy]
             end...,
-            zeros(3, 9),
+            zeros(3, 9),   # padding for the 3 bubble nodes in the shear element
         )
         ke += B' * D * B * scv.detJdV[q]
     end
@@ -189,14 +162,16 @@ end
 
 function calculate_element_shear_stiffness_matrix(D, scv::ShellCellValues)
     n_shape = size(scv.N, 2)
+    n_geo   = getnbasefunctions(scv.ip_geo)
     ke = zeros(3n_shape, 3n_shape)
     for q in eachindex(scv.detJdV)
+        ξ = scv.qr.points[q]
         B = hcat(map(1:n_shape) do i
             dx, dy = scv.∇N[q, i]
             B_node = [dx   0.0   0.0
                       dy   0.0   0.0]
-            if i ≤ 3
-                N = scv.N[q, i]
+            if i ≤ n_geo   # corner nodes carry θ; use ip_geo (P1) for θ interpolation
+                N = Ferrite.reference_shape_value(scv.ip_geo, ξ, i)
                 B_node += [0.0   0.0   -N
                            0.0   N     0.0]
             end
@@ -210,8 +185,10 @@ end
 
 # ─── Combined element stiffness ───────────────────────────────────────────────
 #
-# scv_mb : ShellCellValues for membrane + bending (qr1, ip3 geometry, ip3 shape)
-# scv_s  : ShellCellValues for shear             (qr3, ip3 geometry, ip6 shape)
+# scv_mb : ShellCellValues for membrane + bending
+#          (e.g. qr1, Lagrange{RefTriangle,1} geometry, Lagrange{RefTriangle,1} shape)
+# scv_s  : ShellCellValues for shear
+#          (e.g. qr2, Lagrange{RefTriangle,1} geometry, Lagrange{RefTriangle,2} shape)
 # Both must be reinit!-ed before calling this function.
 
 function elastic_stiffness_matrix(scv_mb::ShellCellValues, scv_s::ShellCellValues, E, ν, t)
@@ -249,14 +226,15 @@ end
 # ─── Geometric stiffness ──────────────────────────────────────────────────────
 
 function calculate_element_geometric_stiffness_matrix(scv::ShellCellValues, σ)
+    n_geo = getnbasefunctions(scv.ip_geo)
     kg = zeros(15, 15)
     for q in eachindex(scv.detJdV)
         # G matrices: row k = ∂(displacement component k)/∂(x or y), for all 15 DOFs.
         # Ferrite DOF ordering: (u1,v1,w1, u2,v2,w2, u3,v3,w3, θx1,θy1,...)
-        # Only the translational DOFs 1–9 are non-zero.
+        # Only the translational DOFs 1–3*n_geo are non-zero.
         Nuvw_x = zeros(3, 15)
         Nuvw_y = zeros(3, 15)
-        for i in 1:3
+        for i in 1:n_geo
             dx, dy = scv.∇N[q, i]
             for k in 1:3   # u, v, w components
                 Nuvw_x[k, 3(i-1)+k] = dx

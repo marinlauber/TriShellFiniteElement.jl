@@ -4,15 +4,16 @@ using LinearAlgebra
 using Test
 
 # Common setup
-ip3 = TriShellFiniteElement.IP3()
-ip6 = TriShellFiniteElement.IP6()
+ip3 = Lagrange{RefTriangle, 1}()
+ip6 = Lagrange{RefTriangle, 2}()
 qr1 = QuadratureRule{RefTriangle}(1)
-qr3 = QuadratureRule{RefTriangle}(3)
+qr2 = QuadratureRule{RefTriangle}(2)
 
-# Unit right triangle in 3D (z=0 plane)
-# Node coords: P1=(0,0,0), P2=(1,0,0), P3=(0,1,0)
-# Area = 0.5, local frame: t1=(1,0,0), t2=(0,1,0), n=(0,0,1)
-x_unit = [Vec{3}((0.0, 0.0, 0.0)), Vec{3}((1.0, 0.0, 0.0)), Vec{3}((0.0, 1.0, 0.0))]
+# Unit right triangle in 3D (z=0 plane), Ferrite node ordering:
+# Lagrange{RefTriangle,1}: N1=ξ₁, N2=ξ₂, N3=1-ξ₁-ξ₂
+# → node 1 at ξ=(1,0) → (1,0,0), node 2 at ξ=(0,1) → (0,1,0), node 3 at ξ=(0,0) → (0,0,0)
+# Gives J1=(1,0,0), J2=(0,1,0), area=0.5, local frame = identity
+x_unit = [Vec{3}((1.0, 0.0, 0.0)), Vec{3}((0.0, 1.0, 0.0)), Vec{3}((0.0, 0.0, 0.0))]
 
 E = 210e3
 ν = 0.3
@@ -69,7 +70,7 @@ end
 end
 
 @testset "Membrane stiffness matrix" begin
-    scv = TriShellFiniteElement.ShellCellValues(qr1, ip3, ip3)
+    scv = ShellCellValues(qr1, ip3, ip3)
     reinit!(scv, x_unit)
     Dm = TriShellFiniteElement.calculate_membrane_constitutive_matrix(E, ν, t)
     ke = TriShellFiniteElement.calculate_element_membrane_stiffness_matrix(Dm, scv)
@@ -82,11 +83,11 @@ end
     tol = 1e-6 * maximum(abs.(λ))
     @test count(abs.(λ) .< tol) == 3                                  # 3 rigid body modes
 
-    # Rigid body modes: Tx, Ty, Rz for unit triangle with nodes (0,0),(1,0),(0,1)
-    # DOF ordering: (u1, v1, u2, v2, u3, v3)
+    # Rigid body modes: Tx, Ty, Rz
+    # DOF ordering: (u1,v1, u2,v2, u3,v3); node coords: P1=(1,0), P2=(0,1), P3=(0,0)
     Tx = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
     Ty = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
-    Rz = [0.0, 0.0, 0.0, 1.0, -1.0, 0.0]  # rotation about z: u=-yω, v=xω
+    Rz = [0.0, 1.0, -1.0, 0.0, 0.0, 0.0]  # u=-y, v=x: P1→(0,1), P2→(-1,0), P3→(0,0)
     @test Tx' * ke * Tx ≈ 0 atol = 1e-10
     @test Ty' * ke * Ty ≈ 0 atol = 1e-10
     @test Rz' * ke * Rz ≈ 0 atol = 1e-10
@@ -98,18 +99,18 @@ end
 
     # uniform element scaling leaves membrane stiffness unchanged:
     # larger area (×s²) and smaller strain gradients (×1/s²) cancel out exactly
-    x_double = [Vec{3}((0.0, 0.0, 0.0)), Vec{3}((2.0, 0.0, 0.0)), Vec{3}((0.0, 2.0, 0.0))]
-    scv2 = TriShellFiniteElement.ShellCellValues(qr1, ip3, ip3)
+    x_double = [Vec{3}((2.0, 0.0, 0.0)), Vec{3}((0.0, 2.0, 0.0)), Vec{3}((0.0, 0.0, 0.0))]
+    scv2 = ShellCellValues(qr1, ip3, ip3)
     reinit!(scv2, x_double)
     ke_double = TriShellFiniteElement.calculate_element_membrane_stiffness_matrix(Dm, scv2)
     @test ke_double ≈ ke
 
-    # analytical value check for unit triangle: ke[1,1] = (E/(1-ν²) + G) * t / 2
-    @test ke[1, 1] ≈ (E / (1 - ν^2) + G) * t / 2
+    # analytical value: node 1 at (1,0) has ∇N1=(1,0), so ke[1,1] = D[1,1]*area = E/(1-ν²)*t/2
+    @test ke[1, 1] ≈ E / (1 - ν^2) * t / 2
 end
 
 @testset "Bending stiffness matrix" begin
-    scv = TriShellFiniteElement.ShellCellValues(qr1, ip3, ip3)
+    scv = ShellCellValues(qr1, ip3, ip3)
     reinit!(scv, x_unit)
     Db = TriShellFiniteElement.calculate_bending_constitutive_matrix(E, ν, t)
     ke = TriShellFiniteElement.calculate_element_bending_stiffness_matrix(Db, scv)
@@ -118,14 +119,12 @@ end
     @test ke ≈ ke'
     @test all(eigvals(Symmetric(ke)) .≥ -1e-8)                       # positive semi-definite
 
-    # rigid body rotations about x and y produce zero bending energy
-    # DOF ordering per node: (w, θx, θy); node coords (0,0),(1,0),(0,1)
-    # Convention 1: γyz = ∂w/∂y + θx → Rx: w=y, θx=-1
-    # Rx: w_i = y_i, θx_i = -1, θy_i = 0  → w=(0,0,1), θx=(-1,-1,-1), θy=(0,0,0)
-    Rx = [0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 1.0, -1.0, 0.0, zeros(9)...]
-    # Convention 1: γxz = ∂w/∂x - θy → Ry: w=x, θy=+1
-    # Ry: w_i = x_i, θx_i = 0, θy_i = 1  → w=(0,1,0), θx=(0,0,0), θy=(1,1,1)
-    Ry = [0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, zeros(9)...]
+    # Rigid body rotations about x and y produce zero bending energy.
+    # DOF ordering per node: (w,θx,θy); node coords: P1=(1,0), P2=(0,1), P3=(0,0)
+    # Convention 1: γyz = ∂w/∂y + θx → Rx: w=y_i, θx=-1
+    Rx = [0.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0, 0.0, zeros(9)...]
+    # Convention 1: γxz = ∂w/∂x - θy → Ry: w=x_i, θy=+1
+    Ry = [1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, zeros(9)...]
     @test Rx' * ke * Rx ≈ 0 atol = 1e-8
     @test Ry' * ke * Ry ≈ 0 atol = 1e-8
 
@@ -141,7 +140,7 @@ end
 end
 
 @testset "Shear stiffness matrix" begin
-    scv = TriShellFiniteElement.ShellCellValues(qr3, ip3, ip6)
+    scv = ShellCellValues(qr2, ip3, ip6)
     reinit!(scv, x_unit)
     Ds = TriShellFiniteElement.calculate_shear_constitutive_matrix(E, ν, t)
     ke = TriShellFiniteElement.calculate_element_shear_stiffness_matrix(Ds, scv)
@@ -157,8 +156,8 @@ end
 end
 
 @testset "Combined elastic stiffness matrix" begin
-    scv_mb = TriShellFiniteElement.ShellCellValues(qr1, ip3, ip3)
-    scv_s  = TriShellFiniteElement.ShellCellValues(qr3, ip3, ip6)
+    scv_mb = ShellCellValues(qr1, ip3, ip3)
+    scv_s  = ShellCellValues(qr2, ip3, ip6)
     reinit!(scv_mb, x_unit)
     reinit!(scv_s,  x_unit)
     ke = TriShellFiniteElement.elastic_stiffness_matrix(scv_mb, scv_s, E, ν, t)
@@ -173,13 +172,13 @@ end
 
     # DOF order after Ferrite reindexing:
     # (u1,v1,w1, u2,v2,w2, u3,v3,w3, θx1,θy1, θx2,θy2, θx3,θy3)
-    # Node coords: P1=(0,0), P2=(1,0), P3=(0,1)
+    # Node coords: P1=(1,0), P2=(0,1), P3=(0,0)
     Tx = [1,0,0, 1,0,0, 1,0,0, 0,0, 0,0, 0,0]                       # translate x
     Ty = [0,1,0, 0,1,0, 0,1,0, 0,0, 0,0, 0,0]                       # translate y
     Tz = [0,0,1, 0,0,1, 0,0,1, 0,0, 0,0, 0,0]                       # translate z
-    Rx = [0,0,0, 0,0,0, 0,0,1, -1,0, -1,0, -1,0]                    # rotate x: w=y_i, θx=-1 (γyz = ∂w/∂y + θx = 0)
-    Ry = [0,0,0, 0,0,1, 0,0,0, 0,1, 0,1, 0,1]                       # rotate y: w=x_i, θy=+1 (γxz = ∂w/∂x - θy = 0)
-    Rz = [0,0,0, 0,1,0, -1,0,0, 0,0, 0,0, 0,0]                      # rotate z: u=-y_i, v=x_i
+    Rx = [0,0,0, 0,0,1, 0,0,0, -1,0, -1,0, -1,0]                    # w=y_i: P1→0, P2→1, P3→0; θx=-1
+    Ry = [0,0,1, 0,0,0, 0,0,0, 0,1, 0,1, 0,1]                       # w=x_i: P1→1, P2→0, P3→0; θy=+1
+    Rz = [0,1,0, -1,0,0, 0,0,0, 0,0, 0,0, 0,0]                      # u=-y, v=x: P1→(0,1), P2→(-1,0), P3→(0,0)
     for mode in (Tx, Ty, Tz, Rx, Ry, Rz)
         @test mode' * ke * mode ≈ 0 atol = 1e-6
     end
