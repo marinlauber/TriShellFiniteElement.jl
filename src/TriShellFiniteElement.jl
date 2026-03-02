@@ -226,8 +226,8 @@ function calculate_element_shear_stiffness_matrix(D, cv, ip_geo, ip_shape, qr, x
 
                 N = Ferrite.reference_shape_value(ip_shape, ξ, i)
 
-                B_node += [0.0     0.0     N
-                           0.0     -N     0.0]
+                B_node += [0.0     0.0     -N
+                           0.0      N     0.0]
 
             end
 

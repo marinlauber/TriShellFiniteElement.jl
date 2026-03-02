@@ -1,0 +1,182 @@
+using TriShellFiniteElement
+using Ferrite
+using LinearAlgebra
+using Test
+
+# Common setup
+ip3 = TriShellFiniteElement.IP3()
+ip6 = TriShellFiniteElement.IP6()
+qr1 = QuadratureRule{RefTriangle}(1)
+qr3 = QuadratureRule{RefTriangle}(3)
+
+# Unit right triangle in local 2D coordinates
+x_unit = [Vec{2}((0.0, 0.0)), Vec{2}((1.0, 0.0)), Vec{2}((0.0, 1.0))]
+# Area = 0.5, det(J) = 1
+
+E = 210e3
+ν = 0.3
+t = 1.0
+G = E / (2 * (1 + ν))
+
+@testset "Membrane constitutive matrix" begin
+    D = TriShellFiniteElement.calculate_membrane_constitutive_matrix(E, ν, t)
+    @test size(D) == (3, 3)
+    @test D ≈ D'
+    @test D[1, 1] ≈ E * t / (1 - ν^2)
+    @test D[2, 2] ≈ E * t / (1 - ν^2)
+    @test D[1, 2] ≈ ν * E * t / (1 - ν^2)
+    @test D[3, 3] ≈ G * t
+    @test D[1, 3] ≈ 0
+    @test D[2, 3] ≈ 0
+    @test all(eigvals(D) .> 0)
+
+    # scales linearly with thickness
+    D2 = TriShellFiniteElement.calculate_membrane_constitutive_matrix(E, ν, 2t)
+    @test D2 ≈ 2 * D
+end
+
+@testset "Bending constitutive matrix" begin
+    D = TriShellFiniteElement.calculate_bending_constitutive_matrix(E, ν, t)
+    D_const = E * t^3 / (12 * (1 - ν^2))
+    @test size(D) == (3, 3)
+    @test D ≈ D'
+    @test D[1, 1] ≈ D_const
+    @test D[2, 2] ≈ D_const
+    @test D[1, 2] ≈ D_const * ν
+    @test D[3, 3] ≈ D_const * (1 - ν) / 2
+    @test D[1, 3] ≈ 0
+    @test D[2, 3] ≈ 0
+    @test all(eigvals(D) .> 0)
+
+    # scales as t³
+    D2 = TriShellFiniteElement.calculate_bending_constitutive_matrix(E, ν, 2t)
+    @test D2 ≈ 8 * D
+end
+
+@testset "Shear constitutive matrix" begin
+    D = TriShellFiniteElement.calculate_shear_constitutive_matrix(E, ν, t)
+    @test size(D) == (2, 2)
+    @test D ≈ D'
+    @test D[1, 1] ≈ 5 / 6 * G * t
+    @test D[2, 2] ≈ 5 / 6 * G * t
+    @test D[1, 2] ≈ 0
+    @test all(eigvals(D) .> 0)
+
+    # scales linearly with thickness
+    D2 = TriShellFiniteElement.calculate_shear_constitutive_matrix(E, ν, 2t)
+    @test D2 ≈ 2 * D
+end
+
+@testset "Membrane stiffness matrix" begin
+    cv = CellValues(qr1, ip3, ip3)
+    reinit!(cv, x_unit)
+    Dm = TriShellFiniteElement.calculate_membrane_constitutive_matrix(E, ν, t)
+    ke = TriShellFiniteElement.calculate_element_membrane_stiffness_matrix(Dm, cv, ip3, ip3, qr1, x_unit)
+
+    @test size(ke) == (6, 6)
+    @test ke ≈ ke'
+
+    λ = eigvals(Symmetric(ke))
+    @test all(λ .≥ -1e-8)                                            # positive semi-definite
+    tol = 1e-6 * maximum(abs.(λ))
+    @test count(abs.(λ) .< tol) == 3                                  # 3 rigid body modes
+
+    # Rigid body modes: Tx, Ty, Rz for unit triangle with nodes (0,0),(1,0),(0,1)
+    # DOF ordering: (u1, v1, u2, v2, u3, v3)
+    Tx = [1.0, 0.0, 1.0, 0.0, 1.0, 0.0]
+    Ty = [0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+    Rz = [0.0, 0.0, 0.0, 1.0, -1.0, 0.0]  # rotation about z: u=-yω, v=xω
+    @test Tx' * ke * Tx ≈ 0 atol = 1e-10
+    @test Ty' * ke * Ty ≈ 0 atol = 1e-10
+    @test Rz' * ke * Rz ≈ 0 atol = 1e-10
+
+    # stiffness scales linearly with E
+    Dm2 = TriShellFiniteElement.calculate_membrane_constitutive_matrix(2E, ν, t)
+    ke2 = TriShellFiniteElement.calculate_element_membrane_stiffness_matrix(Dm2, cv, ip3, ip3, qr1, x_unit)
+    @test ke2 ≈ 2 * ke
+
+    # uniform element scaling leaves membrane stiffness unchanged:
+    # larger area (×s²) and smaller strain gradients (×1/s²) cancel out exactly
+    x_double = [Vec{2}((0.0, 0.0)), Vec{2}((2.0, 0.0)), Vec{2}((0.0, 2.0))]
+    reinit!(cv, x_double)
+    ke_double = TriShellFiniteElement.calculate_element_membrane_stiffness_matrix(Dm, cv, ip3, ip3, qr1, x_double)
+    @test ke_double ≈ ke
+
+    # analytical value check for unit triangle: ke[1,1] = (E/(1-ν²) + G) * t / 2
+    reinit!(cv, x_unit)
+    ke_unit = TriShellFiniteElement.calculate_element_membrane_stiffness_matrix(Dm, cv, ip3, ip3, qr1, x_unit)
+    @test ke_unit[1, 1] ≈ (E / (1 - ν^2) + G) * t / 2
+end
+
+@testset "Bending stiffness matrix" begin
+    cv = CellValues(qr1, ip3, ip3)
+    reinit!(cv, x_unit)
+    Db = TriShellFiniteElement.calculate_bending_constitutive_matrix(E, ν, t)
+    ke = TriShellFiniteElement.calculate_element_bending_stiffness_matrix(Db, cv, ip3, ip3, qr1, x_unit)
+
+    @test size(ke) == (18, 18)
+    @test ke ≈ ke'
+    @test all(eigvals(Symmetric(ke)) .≥ -1e-8)                       # positive semi-definite
+
+    # rigid body rotations about x and y produce zero bending energy
+    # DOF ordering per node: (w, θx, θy); node coords (0,0),(1,0),(0,1)
+    # Convention 1: γyz = ∂w/∂y + θx → Rx: w=y, θx=-1
+    # Rx: w_i = y_i, θx_i = -1, θy_i = 0  → w=(0,0,1), θx=(-1,-1,-1), θy=(0,0,0)
+    Rx = [0.0, -1.0, 0.0, 0.0, -1.0, 0.0, 1.0, -1.0, 0.0, zeros(9)...]
+    # Convention 1: γxz = ∂w/∂x - θy → Ry: w=x, θy=+1
+    # Ry: w_i = x_i, θx_i = 0, θy_i = 1  → w=(0,1,0), θx=(0,0,0), θy=(1,1,1)
+    Ry = [0.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, zeros(9)...]
+    @test Rx' * ke * Rx ≈ 0 atol = 1e-8
+    @test Ry' * ke * Ry ≈ 0 atol = 1e-8
+
+    # stiffness scales linearly with E
+    Db2 = TriShellFiniteElement.calculate_bending_constitutive_matrix(2E, ν, t)
+    ke2 = TriShellFiniteElement.calculate_element_bending_stiffness_matrix(Db2, cv, ip3, ip3, qr1, x_unit)
+    @test ke2 ≈ 2 * ke
+
+    # stiffness scales as t³
+    Db_t2 = TriShellFiniteElement.calculate_bending_constitutive_matrix(E, ν, 2t)
+    ke_t2 = TriShellFiniteElement.calculate_element_bending_stiffness_matrix(Db_t2, cv, ip3, ip3, qr1, x_unit)
+    @test ke_t2 ≈ 8 * ke
+end
+
+@testset "Shear stiffness matrix" begin
+    cv = CellValues(qr3, ip6, ip3)
+    reinit!(cv, x_unit)
+    Ds = TriShellFiniteElement.calculate_shear_constitutive_matrix(E, ν, t)
+    ke = TriShellFiniteElement.calculate_element_shear_stiffness_matrix(Ds, cv, ip3, ip6, qr3, x_unit)
+
+    @test size(ke) == (18, 18)
+    @test ke ≈ ke'
+    @test all(eigvals(Symmetric(ke)) .≥ -1e-8)                       # positive semi-definite
+
+    # stiffness scales linearly with E
+    Ds2 = TriShellFiniteElement.calculate_shear_constitutive_matrix(2E, ν, t)
+    ke2 = TriShellFiniteElement.calculate_element_shear_stiffness_matrix(Ds2, cv, ip3, ip6, qr3, x_unit)
+    @test ke2 ≈ 2 * ke
+end
+
+@testset "Combined elastic stiffness matrix" begin
+    ke = TriShellFiniteElement.elastic_stiffness_matrix!(qr1, qr3, ip3, ip6, E, ν, t, x_unit)
+
+    @test size(ke) == (15, 15)
+    @test ke ≈ ke'
+
+    λ = eigvals(Symmetric(ke))
+    @test all(λ .≥ -1e-8)                                            # positive semi-definite
+    tol = 1e-6 * maximum(abs.(λ))
+    @test count(abs.(λ) .< tol) == 6                                  # 6 rigid body modes
+
+    # DOF order after Ferrite reindexing:
+    # (u1,v1,w1, u2,v2,w2, u3,v3,w3, θx1,θy1, θx2,θy2, θx3,θy3)
+    # Node coords: P1=(0,0), P2=(1,0), P3=(0,1)
+    Tx = [1,0,0, 1,0,0, 1,0,0, 0,0, 0,0, 0,0]                       # translate x
+    Ty = [0,1,0, 0,1,0, 0,1,0, 0,0, 0,0, 0,0]                       # translate y
+    Tz = [0,0,1, 0,0,1, 0,0,1, 0,0, 0,0, 0,0]                       # translate z
+    Rx = [0,0,0, 0,0,0, 0,0,1, -1,0, -1,0, -1,0]                     # rotate x: w=y_i, θx=-1 (γyz = ∂w/∂y + θx = 0)
+    Ry = [0,0,0, 0,0,1, 0,0,0, 0,1, 0,1, 0,1]                        # rotate y: w=x_i, θy=+1 (γxz = ∂w/∂x - θy = 0)
+    Rz = [0,0,0, 0,1,0, -1,0,0, 0,0, 0,0, 0,0]                      # rotate z: u=-y_i, v=x_i
+    for mode in (Tx, Ty, Tz, Rx, Ry, Rz)
+        @test mode' * ke * mode ≈ 0 atol = 1e-6
+    end
+end

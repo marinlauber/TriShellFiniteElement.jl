@@ -78,3 +78,5 @@ end
     include("global_to_local_coordinate_testing.jl")
     @test X1 ≈ 0
 end
+
+include("stiffness_matrices.jl")
