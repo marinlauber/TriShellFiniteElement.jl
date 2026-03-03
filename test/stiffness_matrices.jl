@@ -115,16 +115,17 @@ end
     Db = TriShellFiniteElement.calculate_bending_constitutive_matrix(E, ν, t)
     ke = TriShellFiniteElement.calculate_element_bending_stiffness_matrix(Db, scv)
 
-    @test size(ke) == (18, 18)
+    # DOF layout: (w,θx,θy)×3 corner nodes + 3 zero padding slots = 12×12
+    @test size(ke) == (12, 12)
     @test ke ≈ ke'
     @test all(eigvals(Symmetric(ke)) .≥ -1e-8)                       # positive semi-definite
 
     # Rigid body rotations about x and y produce zero bending energy.
     # DOF ordering per node: (w,θx,θy); node coords: P1=(1,0), P2=(0,1), P3=(0,0)
     # Convention 1: γyz = ∂w/∂y + θx → Rx: w=y_i, θx=-1
-    Rx = [0.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0, 0.0, zeros(9)...]
+    Rx = [0.0, -1.0, 0.0, 1.0, -1.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 0.0]
     # Convention 1: γxz = ∂w/∂x - θy → Ry: w=x_i, θy=+1
-    Ry = [1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, zeros(9)...]
+    Ry = [1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
     @test Rx' * ke * Rx ≈ 0 atol = 1e-8
     @test Ry' * ke * Ry ≈ 0 atol = 1e-8
 
@@ -180,6 +181,79 @@ end
     Ry = [0,0,1, 0,0,0, 0,0,0, 0,1, 0,1, 0,1]                       # w=x_i: P1→1, P2→0, P3→0; θy=+1
     Rz = [0,1,0, -1,0,0, 0,0,0, 0,0, 0,0, 0,0]                      # u=-y, v=x: P1→(0,1), P2→(-1,0), P3→(0,0)
     for mode in (Tx, Ty, Tz, Rx, Ry, Rz)
+        @test mode' * ke * mode ≈ 0 atol = 1e-6
+    end
+end
+
+# Rigid body modes shared by MITC3 and MITC3+ tests
+# DOF order: (u1,v1,w1, u2,v2,w2, u3,v3,w3, θx1,θy1, θx2,θy2, θx3,θy3)
+# Node coords: P1=(1,0), P2=(0,1), P3=(0,0)
+const RBM_Tx = Float64[1,0,0, 1,0,0, 1,0,0, 0,0, 0,0, 0,0]
+const RBM_Ty = Float64[0,1,0, 0,1,0, 0,1,0, 0,0, 0,0, 0,0]
+const RBM_Tz = Float64[0,0,1, 0,0,1, 0,0,1, 0,0, 0,0, 0,0]
+const RBM_Rx = Float64[0,0,0, 0,0,1, 0,0,0, -1,0, -1,0, -1,0]   # w=y_i; θx=-1
+const RBM_Ry = Float64[0,0,1, 0,0,0, 0,0,0,  0,1,  0,1,  0,1]   # w=x_i; θy=+1
+const RBM_Rz = Float64[0,1,0, -1,0,0, 0,0,0, 0,0,  0,0,  0,0]   # u=-y, v=x
+
+@testset "MITC3 shear stiffness matrix" begin
+    scv = ShellCellValues(qr2, ip3, ip3)
+    reinit!(scv, x_unit)
+    Ds = TriShellFiniteElement.calculate_shear_constitutive_matrix(E, ν, t)
+    ke = TriShellFiniteElement.calculate_element_shear_stiffness_matrix_MITC3(Ds, scv)
+
+    @test size(ke) == (9, 9)
+    @test ke ≈ ke'
+    @test all(eigvals(Symmetric(ke)) .≥ -1e-10)   # positive semi-definite
+
+    # Rigid body modes in (w,θx,θy)×3 ordering give zero shear energy
+    # Tz: w=1, θ=0
+    Tz_s = [1,0,0, 1,0,0, 1,0,0]
+    # Rx: w=y_i, θx=-1; node coords: y1=0, y2=1, y3=0
+    Rx_s = [0,-1,0, 1,-1,0, 0,-1,0]
+    # Ry: w=x_i, θy=+1; node coords: x1=1, x2=0, x3=0
+    Ry_s = [1,0,1, 0,0,1, 0,0,1]
+    for mode in (Tz_s, Rx_s, Ry_s)
+        @test mode' * ke * mode ≈ 0 atol = 1e-8
+    end
+
+    # scales linearly with E
+    Ds2 = TriShellFiniteElement.calculate_shear_constitutive_matrix(2E, ν, t)
+    ke2 = TriShellFiniteElement.calculate_element_shear_stiffness_matrix_MITC3(Ds2, scv)
+    @test ke2 ≈ 2ke
+end
+
+@testset "MITC3 combined stiffness matrix" begin
+    scv = ShellCellValues(qr2, ip3, ip3)
+    reinit!(scv, x_unit)
+    ke = TriShellFiniteElement.elastic_stiffness_matrix_MITC3(scv, E, ν, t)
+
+    @test size(ke) == (15, 15)
+    @test ke ≈ ke'
+
+    λ = eigvals(Symmetric(ke))
+    @test all(λ .≥ -1e-8)                                           # positive semi-definite
+    tol = 1e-6 * maximum(abs.(λ))
+    @test count(abs.(λ) .< tol) == 6                                 # 6 rigid body modes
+
+    for mode in (RBM_Tx, RBM_Ty, RBM_Tz, RBM_Rx, RBM_Ry, RBM_Rz)
+        @test mode' * ke * mode ≈ 0 atol = 1e-6
+    end
+end
+
+@testset "MITC3+ combined stiffness matrix" begin
+    scv = ShellCellValues(qr2, ip3, ip3)
+    reinit!(scv, x_unit)
+    ke = TriShellFiniteElement.elastic_stiffness_matrix_MITC3plus(scv, E, ν, t)
+
+    @test size(ke) == (15, 15)
+    @test ke ≈ ke'
+
+    λ = eigvals(Symmetric(ke))
+    @test all(λ .≥ -1e-8)                                           # positive semi-definite
+    tol = 1e-6 * maximum(abs.(λ))
+    @test count(abs.(λ) .< tol) == 6                                 # 6 rigid body modes
+
+    for mode in (RBM_Tx, RBM_Ty, RBM_Tz, RBM_Rx, RBM_Ry, RBM_Rz)
         @test mode' * ke * mode ≈ 0 atol = 1e-6
     end
 end

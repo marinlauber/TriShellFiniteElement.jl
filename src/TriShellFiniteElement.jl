@@ -3,6 +3,9 @@ module TriShellFiniteElement
 using Ferrite, LinearAlgebra, Tensors
 import Ferrite: reinit!
 
+include("utils.jl")
+export ShellMesh
+
 
 """
     ShellCellValues{}
@@ -25,6 +28,7 @@ struct ShellCellValues{QR, IPG, IPS, T <: AbstractFloat} <: AbstractCellValues
     ∇N          :: Matrix{Vec{2, T}}   # local 2D gradients (n_qp × n_shape)
     detJdV      :: Vector{T}           # area element × weight (n_qp,)
     local_frame :: Matrix{T}           # 3×3 rotation matrix [t1 | t2 | n]
+    J_loc       :: Matrix{T}           # 2×2 local Jacobian  [J1·t1 J2·t1; J1·t2 J2·t2]
 end
 export ShellCellValues
 
@@ -39,6 +43,7 @@ function ShellCellValues(qr::QuadratureRule, ip_geo::Interpolation, ip_shape::In
         fill(zero(Vec{2, Float64}), n_qp, n_shape),
         zeros(n_qp),
         zeros(3, 3),
+        zeros(2, 2),
     )
 end
 
@@ -69,12 +74,16 @@ function reinit!(scv::ShellCellValues, x::AbstractVector{<:Vec{3}})
         n_unit = n_vec / area
         t2     = n_unit × t1
 
-        # Store local frame from the first quadrature point.
+        # Store local frame and local Jacobian from the first quadrature point.
         # For linear geometry J is constant over the element, so this is exact.
         if q == 1
             scv.local_frame[:, 1] .= Tuple(t1)
             scv.local_frame[:, 2] .= Tuple(t2)
             scv.local_frame[:, 3] .= Tuple(n_unit)
+            scv.J_loc[1, 1] = J1 ⋅ t1
+            scv.J_loc[1, 2] = J2 ⋅ t1
+            scv.J_loc[2, 1] = J1 ⋅ t2
+            scv.J_loc[2, 2] = J2 ⋅ t2
         end
 
         # Metric tensor g = JᵀJ (2×2, symmetric)
@@ -141,10 +150,24 @@ function calculate_element_membrane_stiffness_matrix(D, scv::ShellCellValues)
     end
     return ke
 end
+function membrane_terms!(Bm, scv::ShellCellValues, qp)
+    fill!(Bm, 0.0)
+    @inbounds for i in 1:getnbasefunctions(scv.ip_shape) # check this
+        dx, dy = scv.∇N[qp, i]
+        col = (i-1)*5
+        # εxx
+        Bm[1,col+1] = dx
+        # εyy
+        Bm[2,col+2] = dy
+        # γxy
+        Bm[3,col+1] = dy
+        Bm[3,col+2] = dx
+    end
+end
 
 function calculate_element_bending_stiffness_matrix(D, scv::ShellCellValues)
     n_geo = getnbasefunctions(scv.ip_geo)
-    ke = zeros(18, 18)
+    ke = zeros(4n_geo, 4n_geo)
     for q in eachindex(scv.detJdV)
         B = hcat(
             ntuple(n_geo) do i
@@ -152,12 +175,25 @@ function calculate_element_bending_stiffness_matrix(D, scv::ShellCellValues)
                 [0.0  0.0   dx
                  0.0  -dy   0.0
                  0.0  -dx   dy]
-            end...,
-            zeros(3, 9),   # padding for the 3 bubble nodes in the shear element
+            end..., zeros(3, 3),   # padding for the 3 bubble nodes in the shear element
         )
         ke += B' * D * B * scv.detJdV[q]
     end
     return ke
+end
+function bending_terms!(Bb, scv::ShellCellValues, qp)
+    fill!(Bb, 0.0)
+    @inbounds for i in 1:getnbasefunctions(scv.ip_shape)
+        dx, dy = scv.∇N[qp, i]
+        col = (i-1)*5
+        # κxx
+        Bb[1,col+4] = dx
+        # κyy
+        Bb[2,col+5] = dy
+        # κxy
+        Bb[3,col+4] = dy
+        Bb[3,col+5] = dx
+    end
 end
 
 function calculate_element_shear_stiffness_matrix(D, scv::ShellCellValues)
@@ -181,6 +217,136 @@ function calculate_element_shear_stiffness_matrix(D, scv::ShellCellValues)
     end
     return ke
 end
+function shear_terms!(Bs, scv::ShellCellValues, qp)
+    fill!(Bs, 0.0)
+    for i in 1:getnbasefunctions(scv.ip_geo)
+        ξ = scv.qr.points[qp]
+        N = Ferrite.reference_shape_value(scv.ip_shape, ξ, i)
+        dx, dy = scv.∇N[qp, i]
+        col = (i-1)*5
+        # γxz
+        Bs[1,col+3] = dx
+        Bs[1,col+4] = -N
+        # γyz
+        Bs[2,col+3] = dy
+        Bs[2,col+5] = -N
+    end
+end
+
+
+# ─── MITC3 assumed shear ──────────────────────────────────────────────────────
+#
+# MITC3: covariant shear strains sampled at 3 edge-midpoint tying points then
+# interpolated linearly over the element, eliminating transverse-shear locking.
+#
+# Ferrite's P1 triangle: N₁=ξ₁, N₂=ξ₂, N₃=1−ξ₁−ξ₂ (nodes at (1,0),(0,1),(0,0)).
+# Tying points (edge midpoints in reference coords):
+#   ξ_A = (0.5, 0.0) — midpoint of edge 3-1
+#   ξ_B = (0.5, 0.5) — midpoint of edge 1-2
+#   ξ_C = (0.0, 0.5) — midpoint of edge 2-3
+#
+# Assumed covariant strains at quadrature point (ξ₁,ξ₂):
+#   ẽ_{ξ₁,3} = (1−ξ₂)·e_{ξ₁,3}^A + ξ₂·e_{ξ₁,3}^C
+#   ẽ_{ξ₂,3} = ξ₁·e_{ξ₂,3}^B  + (1−ξ₁)·e_{ξ₂,3}^C
+#
+# Cartesian shear: γ = J_loc⁻ᵀ · ẽ_cov
+# where J_loc = [J1·t1 J2·t1; J1·t2 J2·t2] (stored in scv.J_loc after reinit!).
+#
+# Returns 9×9 matrix; DOF order: (w,θx,θy) per node × 3 nodes.
+# Use with qr2 (3-point) or higher for exact integration.
+
+function calculate_element_shear_stiffness_matrix_MITC3(Ds, scv::ShellCellValues)
+    ip   = scv.ip_geo
+    n    = getnbasefunctions(ip)    # 3 for P1 triangle
+    ke   = zeros(3n, 3n)
+
+    J    = scv.J_loc               # 2×2 local Jacobian
+    Jinv = inv(J)
+
+    # Shape function values at the three tying points
+    ξA = Vec{2}((0.5, 0.0));  ξB = Vec{2}((0.5, 0.5));  ξC = Vec{2}((0.0, 0.5))
+    NA = ntuple(i -> Ferrite.reference_shape_value(ip, ξA, i), n)
+    NB = ntuple(i -> Ferrite.reference_shape_value(ip, ξB, i), n)
+    NC = ntuple(i -> Ferrite.reference_shape_value(ip, ξC, i), n)
+
+    # Reference-space shape gradients (constant for P1, eval at any point)
+    dNdξ = ntuple(i -> Ferrite.reference_shape_gradient(ip, ξA, i), n)
+
+    for q in eachindex(scv.detJdV)
+        ξ1, ξ2 = Tuple(scv.qr.points[q])
+
+        # 2×(3n) covariant B matrix at (ξ1,ξ2)
+        B_cov = zeros(2, 3n)
+        for i in 1:n
+            col   = 3(i-1) + 1
+            Nα1   = (1-ξ2)*NA[i] + ξ2*NC[i]   # interpolation weight for ẽ_{ξ1,3}
+            Nα2   = ξ1*NB[i] + (1-ξ1)*NC[i]   # interpolation weight for ẽ_{ξ2,3}
+
+            # w DOF: reference-space gradient
+            B_cov[1, col]   = dNdξ[i][1]
+            B_cov[2, col]   = dNdξ[i][2]
+            # θx DOF: +J_loc[2,α]·Nα  (covariant shear sign convention 1)
+            B_cov[1, col+1] =  Nα1 * J[2, 1]
+            B_cov[2, col+1] =  Nα2 * J[2, 2]
+            # θy DOF: −J_loc[1,α]·Nα
+            B_cov[1, col+2] = -Nα1 * J[1, 1]
+            B_cov[2, col+2] = -Nα2 * J[1, 2]
+        end
+
+        # Covariant → Cartesian: γ = J_loc⁻ᵀ · ẽ_cov
+        B_cart = Jinv' * B_cov
+        ke    += B_cart' * Ds * B_cart * scv.detJdV[q]
+    end
+    return ke
+end
+
+# ─── MITC3+ bending with cubic bubble ─────────────────────────────────────────
+#
+# MITC3+: adds the cubic bubble ψ_b = 27·ξ₁·ξ₂·(1−ξ₁−ξ₂) to the rotation field,
+# which improves bending accuracy for distorted meshes.  The two internal bubble
+# DOFs (θx_b, θy_b) are condensed out at element level.
+#
+# Returns 11×11 bending matrix; DOF order: (w,θx,θy)×3 nodes + (θx_b, θy_b).
+# Shear is unchanged from MITC3 (ψ_b = 0 at all tying points).
+# Use with qr2 or higher (bubble gradient is quadratic → integrand is degree 4).
+
+function calculate_element_bending_stiffness_matrix_MITC3plus(Db, scv::ShellCellValues)
+    n_geo = getnbasefunctions(scv.ip_geo)  # 3
+    n_dof = 3n_geo + 2                     # 11 (9 corner + 2 bubble rotations)
+    Jinv  = inv(scv.J_loc)
+    ke    = zeros(n_dof, n_dof)
+
+    for q in eachindex(scv.detJdV)
+        ξ1, ξ2 = Tuple(scv.qr.points[q])
+
+        # Bubble shape function gradient in reference coords
+        # ψ_b = 27·ξ₁·ξ₂·(1−ξ₁−ξ₂)
+        dψb_dξ1 = 27ξ2 * (1 - 2ξ1 - ξ2)
+        dψb_dξ2 = 27ξ1 * (1 - ξ1 - 2ξ2)
+
+        # Bubble gradient in local Cartesian frame: ∇ψ_b = J_loc⁻ᵀ · [∂/∂ξ₁; ∂/∂ξ₂]
+        dψb_dx, dψb_dy = Jinv' * Vec{2}((dψb_dξ1, dψb_dξ2))
+
+        # 3×11 bending B matrix: [corner nodes (3×9) | bubble (3×2)]
+        B = zeros(3, n_dof)
+        for i in 1:n_geo
+            dx, dy = scv.∇N[q, i]
+            col = 3(i-1) + 1
+            B[1, col+2] = dx           # κ_xx = ∂θy/∂x
+            B[2, col+1] = -dy          # κ_yy = -∂θx/∂y
+            B[3, col+1] = -dx          # 2κ_xy: -∂θx/∂x
+            B[3, col+2] = dy           #        +∂θy/∂y
+        end
+        # Bubble contribution (cols 10=θx_b, 11=θy_b)
+        B[1, 11]  = dψb_dx             # κ_xx from θy_b
+        B[2, 10]  = -dψb_dy            # κ_yy from θx_b
+        B[3, 10]  = -dψb_dx            # 2κ_xy from θx_b
+        B[3, 11]  = dψb_dy             #       from θy_b
+
+        ke += B' * Db * B * scv.detJdV[q]
+    end
+    return ke
+end
 
 
 # ─── Combined element stiffness ───────────────────────────────────────────────
@@ -201,25 +367,114 @@ function elastic_stiffness_matrix(scv_mb::ShellCellValues, scv_s::ShellCellValue
 
     # Remove zero rows/cols (zero w rows in the padded 18×18 bending matrix)
     idx   = [1:10; 13; 16]
-    ke_bs = (ke_b + ke_s)[idx, idx]
+    ke_bs = ke_b + ke_s[idx, idx]
 
     # Static condensation: eliminate bubble w DOFs (nodes 4–6 → indices 10–12)
-    inda  = 1:9
-    indi  = 10:12
-    ke_bs = ke_bs[inda, inda] - ke_bs[inda, indi] * inv(ke_bs[indi, indi]) * ke_bs[indi, inda]
-
-    # Assemble into 15×15 using intermediate component ordering:
-    # (u1,v1,w1,θx1,θy1, u2,v2,w2,θx2,θy2, u3,v3,w3,θx3,θy3)
-    ke = zeros(15, 15)
-    induv = [1, 2, 6, 7, 11, 12]
-    indwt = [3, 4, 5, 8, 9, 10, 13, 14, 15]
-    ke[induv, induv] = ke_m
-    ke[indwt, indwt] = ke_bs
+    inda  = 1:9; indi  = 10:12
+    ke_bs = ke_bs[inda, inda] - ke_bs[inda, indi] * (ke_bs[indi, indi] \ ke_bs[indi, inda])
 
     # Reindex to Ferrite field ordering:
     # (u1,v1,w1, u2,v2,w2, u3,v3,w3, θx1,θy1, θx2,θy2, θx3,θy3)
-    ind_field = [1, 2, 3, 6, 7, 8, 11, 12, 13, 4, 5, 9, 10, 14, 15]
-    return ke[ind_field, ind_field]
+    # maybe we can do that in the assembler only, not here
+    ke = zeros(Float64, 15, 15)
+    I=[1,2,4,5,7,8]; J=[3,10,11,6,12,13,9,14,15]
+    ke[I, I] = ke_m
+    ke[J, J] = ke_bs
+    return ke
+end
+
+# function elastic_stiffness_matrix(scv_mb::ShellCellValues, scv_s::ShellCellValues, E, ν, t)
+#     ndofs = 15 #TODO hard-coded for now
+#     ke = zeros(ndofs, ndofs)
+
+#     Dm = calculate_membrane_constitutive_matrix(E,ν,t)
+#     # Db = calculate_bending_constitutive_matrix(E,ν,t)
+#     # Ds = calculate_shear_constitutive_matrix(E,ν,t)
+
+#     Bm = zeros(3,ndofs)
+#     Bb = zeros(3,ndofs)
+#     # Bs = zeros(2,ndofs)
+
+#     # tmp3 = zeros(3,ndofs)
+#     # tmp2 = zeros(2,ndofs)
+
+#     for qp in 1:getnquadpoints(scv_mb.qr)
+
+#         dA = getdetJdV(scv_mb,qp)
+
+#         membrane_terms!(Bm,scv_mb,qp)
+#         bending_terms!(Bb,scv_mb,qp)
+#         # shear_terms!(Bs,scv_s,qp)
+
+#         # Membrane
+#         mul!(tmp3,Dm,Bm)
+#         mul!(ke,Bm',tmp3,dA,1.0)
+
+#         # Bending
+#         # mul!(tmp3,Db,Bb)
+#         # mul!(ke,Bb',tmp3,dA,1.0)
+#     # end
+#     # # @inbounds for qp in 1:getnquadpoints(scv_s.qr) # not the same
+#     #     # Shear
+#     #     mul!(tmp2,Ds,Bs)
+#     #     mul!(ke,Bs',tmp2,dA,1.0)
+#     end
+
+#     return ke
+# end
+
+# ─── Combined stiffness: MITC3 ────────────────────────────────────────────────
+#
+# Single scv (reinit!-ed); use qr2 (3-point) or higher for exact integration.
+# Returns 15×15 ke in Ferrite DOF order:
+#   (u1,v1,w1, u2,v2,w2, u3,v3,w3, θx1,θy1, θx2,θy2, θx3,θy3)
+
+function elastic_stiffness_matrix_MITC3(scv::ShellCellValues, E, ν, t)
+    ke_m  = calculate_element_membrane_stiffness_matrix(
+                calculate_membrane_constitutive_matrix(E, ν, t), scv)   # 6×6
+    ke_b12 = calculate_element_bending_stiffness_matrix(
+                calculate_bending_constitutive_matrix(E, ν, t), scv)    # 12×12
+    ke_s  = calculate_element_shear_stiffness_matrix_MITC3(
+                calculate_shear_constitutive_matrix(E, ν, t), scv)      # 9×9
+
+    ke_bs = ke_b12[1:9, 1:9] + ke_s   # 9×9: corner nodes only (no bubble padding)
+
+    ke = zeros(Float64, 15, 15)
+    Im = [1,2,4,5,7,8]
+    Ib = [3,10,11, 6,12,13, 9,14,15]
+    ke[Im, Im] = ke_m
+    ke[Ib, Ib] = ke_bs
+    return ke
+end
+
+# ─── Combined stiffness: MITC3+ ───────────────────────────────────────────────
+#
+# MITC3 shear + cubic bubble bending; bubble DOFs condensed at element level.
+# Single scv (reinit!-ed); use qr2 or higher.
+# Returns 15×15 ke in the same Ferrite DOF order as MITC3.
+
+function elastic_stiffness_matrix_MITC3plus(scv::ShellCellValues, E, ν, t)
+    ke_m = calculate_element_membrane_stiffness_matrix(
+                calculate_membrane_constitutive_matrix(E, ν, t), scv)   # 6×6
+    ke_b = calculate_element_bending_stiffness_matrix_MITC3plus(
+                calculate_bending_constitutive_matrix(E, ν, t), scv)    # 11×11
+    ke_s = calculate_element_shear_stiffness_matrix_MITC3(
+                calculate_shear_constitutive_matrix(E, ν, t), scv)      # 9×9
+
+    # Embed 9×9 MITC3 shear in 11×11 (bubble θ DOFs have no shear contribution)
+    ke_bs = copy(ke_b)
+    ke_bs[1:9, 1:9] += ke_s
+
+    # Static condensation: remove bubble rotation DOFs (indices 10–11)
+    ia = 1:9;  ib = 10:11
+    ke_bs_c = ke_bs[ia, ia] - ke_bs[ia, ib] * (ke_bs[ib, ib] \ ke_bs[ib, ia])
+
+    ke = zeros(Float64, 15, 15)
+    Im = [1,2,4,5,7,8]
+    Ib = [3,10,11, 6,12,13, 9,14,15]
+    ke[Im, Im] = ke_m
+    ke[Ib, Ib] = ke_bs_c
+    return ke
 end
 
 
@@ -275,6 +530,29 @@ function assemble_global_Ke!(Ke, dh, scv_mb::ShellCellValues, scv_s::ShellCellVa
         reinit!(scv_s,  x)
         ke = elastic_stiffness_matrix(scv_mb, scv_s, E, ν, t)
         Te = rotation_matrix_for_element_stiffness(scv_mb.local_frame)
+        assemble!(assembler, celldofs(cell), Te * ke * Te')
+    end
+    return Ke
+end
+
+# MITC3 and MITC3+ variants use a single scv (qr2 or higher recommended).
+function assemble_global_Ke_MITC3!(Ke, dh, scv::ShellCellValues, E, ν, t)
+    assembler = start_assemble(Ke)
+    for cell in CellIterator(dh)
+        reinit!(scv, getcoordinates(cell))
+        ke = elastic_stiffness_matrix_MITC3(scv, E, ν, t)
+        Te = rotation_matrix_for_element_stiffness(scv.local_frame)
+        assemble!(assembler, celldofs(cell), Te * ke * Te')
+    end
+    return Ke
+end
+
+function assemble_global_Ke_MITC3plus!(Ke, dh, scv::ShellCellValues, E, ν, t)
+    assembler = start_assemble(Ke)
+    for cell in CellIterator(dh)
+        reinit!(scv, getcoordinates(cell))
+        ke = elastic_stiffness_matrix_MITC3plus(scv, E, ν, t)
+        Te = rotation_matrix_for_element_stiffness(scv.local_frame)
         assemble!(assembler, celldofs(cell), Te * ke * Te')
     end
     return Ke
