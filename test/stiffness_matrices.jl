@@ -233,7 +233,10 @@ end
     λ = eigvals(Symmetric(ke))
     @test all(λ .≥ -1e-8)                                           # positive semi-definite
     tol = 1e-6 * maximum(abs.(λ))
-    @test count(abs.(λ) .< tol) == 6                                 # 6 rigid body modes
+    # Standard MITC3 uses linear assumed strains (tying at A, B, C), matching the order of
+    # P1 displacement-derived shear. This eliminates the spurious zero-energy mode present
+    # in constant tying, giving exactly 6 zero eigenvalues (the 6 rigid body modes).
+    @test count(abs.(λ) .< tol) == 6                                 # exactly 6 RBMs
 
     for mode in (RBM_Tx, RBM_Ty, RBM_Tz, RBM_Rx, RBM_Ry, RBM_Rz)
         @test mode' * ke * mode ≈ 0 atol = 1e-6
@@ -251,7 +254,9 @@ end
     λ = eigvals(Symmetric(ke))
     @test all(λ .≥ -1e-8)                                           # positive semi-definite
     tol = 1e-6 * maximum(abs.(λ))
-    @test count(abs.(λ) .< tol) == 6                                 # 6 rigid body modes
+    # Standard MITC3 shear (linear assumed strains) eliminates the spurious mode,
+    # giving exactly 6 zero eigenvalues (the 6 rigid body modes).
+    @test count(abs.(λ) .< tol) == 6                                 # exactly 6 RBMs
 
     for mode in (RBM_Tx, RBM_Ty, RBM_Tz, RBM_Rx, RBM_Ry, RBM_Rz)
         @test mode' * ke * mode ≈ 0 atol = 1e-6

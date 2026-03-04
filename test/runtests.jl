@@ -83,3 +83,4 @@ import Ferrite: reference_shape_value, reference_shape_gradient
 end
 
 include("stiffness_matrices.jl")
+include("patch_test.jl")
